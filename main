@@ -1,0 +1,395 @@
+"""
+CISO Board Report Generator
+Description: Translates technical security findings into executive-level
+             board reports with business impact, financial exposure estimates,
+             and sector-specific regulatory context.
+             Powered by Anthropic Claude API.
+"""
+
+import anthropic
+import json
+import os
+import sys
+from datetime import datetime
+
+
+# --------------------------------------------------------------------------
+# DEMO FINDINGS 
+# Replace with real findings from your cloud scanner or assessment tool
+# --------------------------------------------------------------------------
+
+DEMO_FINDINGS = {
+    "organisation": "Meridian Financial Services Ltd",
+    "sector": "Financial Services",
+    "annual_revenue_gbp": 45000000,
+    "employee_count": 320,
+    "assessment_date": "23 May 2025",
+    "findings": [
+        {
+            "id": "F-001",
+            "severity": "Critical",
+            "category": "IAM",
+            "title": "Root account MFA not enabled",
+            "detail": "AWS root account has no multi-factor authentication. Full unrestricted access to all cloud resources.",
+            "affected_systems": ["AWS Production Account"]
+        },
+        {
+            "id": "F-002",
+            "severity": "Critical",
+            "category": "S3",
+            "title": "Customer data bucket publicly accessible",
+            "detail": "S3 bucket containing customer transaction records is publicly readable. Estimated 85,000 customer records exposed.",
+            "affected_systems": ["s3://meridian-customer-data-prod"]
+        },
+        {
+            "id": "F-003",
+            "severity": "Critical",
+            "category": "EC2",
+            "title": "SSH open to internet on production servers",
+            "detail": "Production web servers allow SSH access from any IP address (0.0.0.0/0).",
+            "affected_systems": ["prod-web-01", "prod-web-02", "prod-api-01"]
+        },
+        {
+            "id": "F-004",
+            "severity": "High",
+            "category": "IAM",
+            "title": "Overprivileged user accounts",
+            "detail": "3 non-admin staff have AdministratorAccess IAM policy. Violates least privilege principle.",
+            "affected_systems": ["IAM: analyst-john", "IAM: dev-sarah", "IAM: ops-mike"]
+        },
+        {
+            "id": "F-005",
+            "severity": "High",
+            "category": "IAM",
+            "title": "Stale access keys — 142 days without rotation",
+            "detail": "Active AWS access keys not rotated in 142 days. Exceeds 90-day policy threshold.",
+            "affected_systems": ["IAM: dev-deploy service account"]
+        },
+        {
+            "id": "F-006",
+            "severity": "High",
+            "category": "S3",
+            "title": "Backup bucket lacks encryption",
+            "detail": "Database backup bucket has no server-side encryption. Data at rest is unprotected.",
+            "affected_systems": ["s3://meridian-db-backups"]
+        },
+        {
+            "id": "F-007",
+            "severity": "Medium",
+            "category": "CloudTrail",
+            "title": "Audit log integrity validation disabled",
+            "detail": "CloudTrail log file validation not enabled. Logs could be tampered with post-incident.",
+            "affected_systems": ["CloudTrail: mgmt-trail"]
+        },
+        {
+            "id": "F-008",
+            "severity": "Medium",
+            "category": "EC2",
+            "title": "EBS volumes unencrypted",
+            "detail": "Production EC2 instance storage volumes not encrypted. Data at rest exposed if hardware is compromised.",
+            "affected_systems": ["prod-web-01", "prod-db-01"]
+        }
+    ]
+}
+
+
+SECTOR_CONTEXT = {
+    "Financial Services": {
+        "regulators": ["FCA", "PRA", "ICO"],
+        "frameworks": ["FCA SYSC", "DORA", "PCI-DSS", "GDPR"],
+        "fine_multiplier": 1.8,
+        "breach_cost_per_record_gbp": 180,
+        "key_risks": "regulatory sanctions, customer trust erosion, operational resilience obligations under DORA"
+    },
+    "Healthcare": {
+        "regulators": ["ICO", "CQC", "NHS Digital"],
+        "frameworks": ["GDPR", "DSP Toolkit", "Cyber Essentials Plus"],
+        "fine_multiplier": 1.6,
+        "breach_cost_per_record_gbp": 250,
+        "key_risks": "patient safety, NHS contract risk, special category data exposure under GDPR Article 9"
+    },
+    "Critical Infrastructure": {
+        "regulators": ["NCSC", "Ofgem", "ICO"],
+        "frameworks": ["NIS2 Directive", "CAF", "GDPR"],
+        "fine_multiplier": 2.0,
+        "breach_cost_per_record_gbp": 200,
+        "key_risks": "national security implications, NIS2 regulatory obligations, operational disruption at scale"
+    },
+    "Generic": {
+        "regulators": ["ICO", "NCSC"],
+        "frameworks": ["GDPR", "Cyber Essentials", "ISO 27001"],
+        "fine_multiplier": 1.4,
+        "breach_cost_per_record_gbp": 150,
+        "key_risks": "data breach liability, reputational damage, business continuity disruption"
+    }
+}
+
+
+# --------------------------------------------------------------------------
+# FINANCIAL EXPOSURE CALCULATION
+# --------------------------------------------------------------------------
+
+def calculate_financial_exposure(findings: dict) -> dict:
+    sector = findings.get("sector", "Generic")
+    revenue = findings.get("annual_revenue_gbp", 10000000)
+    sector_data = SECTOR_CONTEXT.get(sector, SECTOR_CONTEXT["Generic"])
+
+    critical_count = sum(1 for f in findings["findings"] if f["severity"] == "Critical")
+    high_count = sum(1 for f in findings["findings"] if f["severity"] == "High")
+    medium_count = sum(1 for f in findings["findings"] if f["severity"] == "Medium")
+
+    # Estimate exposed records from findings
+    exposed_records = 0
+    for f in findings["findings"]:
+        if "customer" in f["detail"].lower() or "record" in f["detail"].lower():
+            import re
+            numbers = re.findall(r'\d[\d,]*', f["detail"])
+            for n in numbers:
+                val = int(n.replace(",", ""))
+                if val > 1000:
+                    exposed_records = max(exposed_records, val)
+
+    if exposed_records == 0:
+        exposed_records = findings.get("employee_count", 500) * 10
+
+    # GDPR fine: up to 4% of global annual turnover or £17.5m whichever higher
+    gdpr_fine_estimate = min(revenue * 0.04, 17500000) * sector_data["fine_multiplier"]
+
+    # Breach cost
+    breach_cost = exposed_records * sector_data["breach_cost_per_record_gbp"]
+
+    # Downtime cost: rough estimate based on revenue
+    daily_revenue = revenue / 365
+    downtime_days = 3 + (critical_count * 2)
+    downtime_cost = daily_revenue * downtime_days
+
+    # Remediation cost
+    remediation_cost = (critical_count * 15000) + (high_count * 8000) + (medium_count * 3000)
+
+    total_exposure = breach_cost + downtime_cost + gdpr_fine_estimate
+
+    return {
+        "exposed_records_estimate": exposed_records,
+        "gdpr_fine_estimate_gbp": round(gdpr_fine_estimate),
+        "breach_cost_estimate_gbp": round(breach_cost),
+        "downtime_cost_estimate_gbp": round(downtime_cost),
+        "remediation_cost_gbp": round(remediation_cost),
+        "total_worst_case_exposure_gbp": round(total_exposure),
+        "revenue_at_risk_pct": round((total_exposure / revenue) * 100, 1)
+    }
+
+
+# --------------------------------------------------------------------------
+# AI REPORT GENERATION
+# --------------------------------------------------------------------------
+
+def build_prompt(findings: dict, financials: dict) -> str:
+    sector = findings.get("sector", "Generic")
+    sector_data = SECTOR_CONTEXT.get(sector, SECTOR_CONTEXT["Generic"])
+
+    findings_summary = "\n".join([
+        f"- [{f['severity']}] {f['title']}: {f['detail']}"
+        for f in findings["findings"]
+    ])
+
+    return f"""
+You are a senior cybersecurity advisor writing a board-level executive report for {findings["organisation"]}, 
+a {sector} organisation with {findings["employee_count"]} employees and annual revenue of £{findings["annual_revenue_gbp"]:,}.
+
+The following security findings have been identified:
+
+{findings_summary}
+
+Financial exposure estimates:
+- Worst case total exposure: £{financials["total_worst_case_exposure_gbp"]:,}
+- GDPR fine estimate: £{financials["gdpr_fine_estimate_gbp"]:,}
+- Breach cost estimate: £{financials["breach_cost_estimate_gbp"]:,}
+- Downtime cost estimate: £{financials["downtime_cost_estimate_gbp"]:,}
+- Remediation cost: £{financials["remediation_cost_gbp"]:,}
+- Revenue at risk: {financials["revenue_at_risk_pct"]}%
+
+Sector context:
+- Relevant regulators: {", ".join(sector_data["regulators"])}
+- Applicable frameworks: {", ".join(sector_data["frameworks"])}
+- Key sector risks: {sector_data["key_risks"]}
+
+Write a concise, professional CISO board report. Use plain English — no technical jargon. 
+The audience is the board of directors, not the IT team.
+
+Return ONLY a JSON object in this exact structure:
+
+{{
+  "executive_summary": "3-4 sentence plain English summary of the security posture and business risk",
+  "risk_rating": "Critical | High | Medium | Low",
+  "key_messages": [
+    "3 bullet points a CEO needs to hear — business impact focused, no jargon"
+  ],
+  "financial_narrative": "2-3 sentences explaining the financial exposure in plain English",
+  "regulatory_exposure": "2 sentences on specific regulatory risk for this sector",
+  "priority_actions": [
+    {{
+      "action": "what needs to be done",
+      "timeline": "Immediate (24-48hrs) | Short-term (30 days) | Medium-term (90 days)",
+      "business_rationale": "why the board should care — in business terms",
+      "estimated_cost_gbp": 15000
+    }}
+  ],
+  "unit_economics": {{
+    "cost_of_inaction_gbp": 500000,
+    "cost_of_remediation_gbp": 50000,
+    "roi_narrative": "one sentence on the return on investment of fixing these issues"
+  }},
+  "closing_statement": "2 sentences — board level call to action"
+}}
+
+Return JSON only. No markdown, no explanation outside the JSON.
+"""
+
+
+def generate_board_report(findings: dict, financials: dict) -> dict:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise EnvironmentError("ANTHROPIC_API_KEY not set.")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    print("[*] Generating board report via Claude API...")
+
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": build_prompt(findings, financials)}]
+    )
+
+    raw = message.content[0].text.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"raw_output": raw}
+
+
+# --------------------------------------------------------------------------
+# REPORT SAVING
+# --------------------------------------------------------------------------
+
+def save_report(findings: dict, financials: dict, report: dict, output_dir: str = "sample_output") -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(output_dir, f"board_report_{timestamp}.md")
+
+    lines = []
+    lines.append(f"# Cyber Security Board Report")
+    lines.append(f"\n**Organisation:** {findings['organisation']}")
+    lines.append(f"\n**Sector:** {findings['sector']}")
+    lines.append(f"\n**Report Date:** {datetime.now().strftime('%d %B %Y')}")
+    lines.append(f"\n**Assessment Date:** {findings.get('assessment_date', 'N/A')}")
+    lines.append(f"\n**Overall Risk Rating:** `{report.get('risk_rating', 'N/A')}`")
+    lines.append(f"\n**Prepared by:** CISO Board Report Generator\n")
+    lines.append("\n---\n")
+
+    if "raw_output" in report:
+        lines.append(report["raw_output"])
+    else:
+        lines.append("## Executive Summary\n")
+        lines.append(report.get("executive_summary", "N/A"))
+
+        lines.append("\n\n---\n")
+        lines.append("## Key Messages for the Board\n")
+        for msg in report.get("key_messages", []):
+            lines.append(f"- {msg}")
+
+        lines.append("\n\n---\n")
+        lines.append("## Financial Exposure\n")
+
+        lines.append("### Estimated Financial Impact\n")
+        lines.append(f"| Exposure Type | Estimate |")
+        lines.append(f"|---------------|----------|")
+        lines.append(f"| Worst Case Total Exposure | £{financials['total_worst_case_exposure_gbp']:,} |")
+        lines.append(f"| GDPR Fine Estimate | £{financials['gdpr_fine_estimate_gbp']:,} |")
+        lines.append(f"| Breach Cost Estimate | £{financials['breach_cost_estimate_gbp']:,} |")
+        lines.append(f"| Downtime Cost Estimate | £{financials['downtime_cost_estimate_gbp']:,} |")
+        lines.append(f"| Cost of Remediation | £{financials['remediation_cost_gbp']:,} |")
+        lines.append(f"| Revenue at Risk | {financials['revenue_at_risk_pct']}% |\n")
+
+        lines.append(f"\n{report.get('financial_narrative', 'N/A')}")
+
+        unit = report.get("unit_economics", {})
+        if unit:
+            lines.append(f"\n\n**Cost of inaction:** £{unit.get('cost_of_inaction_gbp', 0):,}")
+            lines.append(f"\n**Cost of remediation:** £{unit.get('cost_of_remediation_gbp', 0):,}")
+            lines.append(f"\n**ROI:** {unit.get('roi_narrative', 'N/A')}")
+
+        lines.append("\n\n---\n")
+        lines.append("## Regulatory Exposure\n")
+        lines.append(report.get("regulatory_exposure", "N/A"))
+
+        lines.append("\n\n---\n")
+        lines.append("## Priority Actions\n")
+        for i, action in enumerate(report.get("priority_actions", []), 1):
+            lines.append(f"### Action {i} — {action.get('timeline', 'N/A')}")
+            lines.append(f"\n**What:** {action.get('action', 'N/A')}")
+            lines.append(f"\n**Why it matters:** {action.get('business_rationale', 'N/A')}")
+            lines.append(f"\n**Estimated cost:** £{action.get('estimated_cost_gbp', 0):,}\n")
+
+        lines.append("\n---\n")
+        lines.append("## Board Statement\n")
+        lines.append(report.get("closing_statement", "N/A"))
+
+    lines.append("\n\n---")
+    lines.append(f"\n*Confidential — prepared for board use only*")
+    lines.append(f"\n*Generated by CISO Board Report Generator*")
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+
+    return path
+
+
+def print_summary(report: dict, financials: dict):
+    print("\n========================================")
+    print("  CISO BOARD REPORT — SUMMARY")
+    print("========================================")
+    print(f"Risk Rating    : {report.get('risk_rating', 'N/A')}")
+    print(f"Total Exposure : £{financials['total_worst_case_exposure_gbp']:,}")
+    print(f"Remediation    : £{financials['remediation_cost_gbp']:,}")
+    print(f"Revenue at Risk: {financials['revenue_at_risk_pct']}%")
+    print("----------------------------------------")
+    print("Key Messages:")
+    for msg in report.get("key_messages", []):
+        print(f"  • {msg}")
+    print("========================================\n")
+
+
+# --------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------
+
+def main():
+    print("=== CISO Board Report Generator ===")
+    print("Security Portfolio Project\n")
+
+    # Load findings — swap DEMO_FINDINGS for real data in production
+    findings = DEMO_FINDINGS
+
+    print(f"[*] Organisation : {findings['organisation']}")
+    print(f"[*] Sector       : {findings['sector']}")
+    print(f"[*] Findings     : {len(findings['findings'])}")
+    print(f"[*] Revenue      : £{findings['annual_revenue_gbp']:,}\n")
+
+    # Calculate financial exposure
+    print("[*] Calculating financial exposure...")
+    financials = calculate_financial_exposure(findings)
+
+    # Generate board report via Claude API
+    report = generate_board_report(findings, financials)
+
+    # Print summary
+    print_summary(report, financials)
+
+    # Save full report
+    path = save_report(findings, financials, report)
+    print(f"[+] Board report saved to: {path}")
+
+
+if __name__ == "__main__":
+    main()
